@@ -25,12 +25,12 @@ import (
 )
 
 var (
-	// GroupVersion is group version used to register these objects
+	// GroupVersion 是用来注册这些对象的 group version。
 	GroupVersion = schema.GroupVersion{Group: "batch.tutorial.kubebuilder.io", Version: "v1"}
 
-	// SchemeBuilder is used to add go types to the GroupVersionKind scheme
+	// SchemeBuilder 被用来给 GroupVersionKind scheme 添加 go 类型。
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
 
-	// AddToScheme adds the types in this group-version to the given scheme.
+	// AddToScheme 将 group-version 中的类型添加到指定的 scheme 中。
 	AddToScheme = SchemeBuilder.AddToScheme
 )
