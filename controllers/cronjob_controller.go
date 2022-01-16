@@ -18,6 +18,8 @@ package controllers
 
 import (
 	"context"
+	kbatch "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -25,7 +27,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	batchv1 "github.com/the-prophet/cronjob/api/v1"
+	batch "github.com/the-prophet/cronjob/api/v1"
 )
 
 type realClock struct{}
@@ -46,21 +48,65 @@ type CronJobReconciler struct {
 	Clock
 }
 
+var (
+	scheduledTimeAnnotation = "batch.tutorial.kubebuilder.io/scheduled-at"
+	jobOwnerKey             = ""
+)
+
 // +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 func (r *CronJobReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	_ = context.Background()
-	_ = r.Log.WithValues("cronjob", req.NamespacedName)
+	ctx := context.Background()
+	log := r.Log.WithValues("cronjob", req.NamespacedName)
 
-	// your logic here
+	var cronJob batch.CronJob
+	if err := r.Get(ctx, req.NamespacedName, &cronJob); err != nil {
+		log.Error(err, "无法获取到CronJob")
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	var childJobs kbatch.JobList
+	if err := r.List(ctx, &childJobs, client.InNamespace(req.Namespace), client.MatchingFields{jobOwnerKey: req.Name}); err != nil {
+		log.Error(err, "无法列出子作业")
+		return ctrl.Result{}, err
+	}
+
+	// 列出所有有效的job
+	var activeJobs []*kbatch.Job
+	var successJobs []*kbatch.Job
+	var failedJobs []*kbatch.Job
+	var mostRecentTime *time.Time
+
+	// 检查job的状态类型
+	isJobFinished := func(job *kbatch.Job) (bool, kbatch.JobConditionType) {
+		for _, condition := range job.Status.Conditions {
+			if (condition.Type == kbatch.JobComplete || condition.Type == kbatch.JobFailed) && condition.Status == corev1.ConditionTrue {
+				return true, condition.Type
+			}
+		}
+		return false, ""
+	}
+
+	for i, job := range childJobs.Items {
+		 _, finishedType := isJobFinished(&job)
+		switch finishedType {
+		case "":
+			activeJobs = append(activeJobs,&job)
+		case kbatch.JobFailed:
+			failedJobs = append(failedJobs, &job)
+		case kbatch.JobComplete:
+			successJobs = append(successJobs, &job)
+		}
+
+	}
 
 	return ctrl.Result{}, nil
 }
 
 func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&batchv1.CronJob{}).
+		For(&batch.CronJob{}).
 		Complete(r)
 }
