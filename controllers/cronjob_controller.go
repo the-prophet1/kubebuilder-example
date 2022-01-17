@@ -18,8 +18,12 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	kbatch "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ref "k8s.io/client-go/tools/reference"
+	"sort"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -75,31 +79,117 @@ func (r *CronJobReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	// 列出所有有效的job
 	var activeJobs []*kbatch.Job
-	var successJobs []*kbatch.Job
+	var successfulJobs []*kbatch.Job
 	var failedJobs []*kbatch.Job
 	var mostRecentTime *time.Time
 
 	// 检查job的状态类型
 	isJobFinished := func(job *kbatch.Job) (bool, kbatch.JobConditionType) {
 		for _, condition := range job.Status.Conditions {
-			if (condition.Type == kbatch.JobComplete || condition.Type == kbatch.JobFailed) && condition.Status == corev1.ConditionTrue {
+			if (condition.Type == kbatch.JobComplete || condition.Type == kbatch.JobFailed) &&
+				condition.Status == corev1.ConditionTrue {
 				return true, condition.Type
 			}
 		}
 		return false, ""
 	}
 
-	for i, job := range childJobs.Items {
-		 _, finishedType := isJobFinished(&job)
+	getScheduledTimeForJob := func(job *kbatch.Job) (*time.Time, error) {
+		timeRow := job.Annotations[scheduledTimeAnnotation]
+		if len(timeRow) == 0 {
+			return nil, nil
+		}
+
+		timeParsed, err := time.Parse(time.RFC3339, timeRow)
+		if err != nil {
+			return nil, err
+		}
+		return &timeParsed, nil
+	}
+
+	for _, job := range childJobs.Items {
+		_, finishedType := isJobFinished(&job)
 		switch finishedType {
 		case "":
-			activeJobs = append(activeJobs,&job)
+			activeJobs = append(activeJobs, &job)
 		case kbatch.JobFailed:
 			failedJobs = append(failedJobs, &job)
 		case kbatch.JobComplete:
-			successJobs = append(successJobs, &job)
+			successfulJobs = append(successfulJobs, &job)
 		}
 
+		// 将作业启动时间存放在注释中
+		scheduledTimeForJob, err := getScheduledTimeForJob(&job)
+		if err != nil {
+			log.Error(err, "无法解析子工作的计划时间", "job", &job)
+			continue
+		}
+		if scheduledTimeForJob != nil {
+			if mostRecentTime == nil {
+				mostRecentTime = scheduledTimeForJob
+			} else if mostRecentTime.Before(*scheduledTimeForJob) {
+				mostRecentTime = scheduledTimeForJob
+			}
+		}
+	}
+
+	if mostRecentTime != nil {
+		cronJob.Status.LastScheduleTime = &metav1.Time{Time: *mostRecentTime}
+	} else {
+		cronJob.Status.LastScheduleTime = nil
+	}
+	cronJob.Status.Active = nil
+
+	for _, activeJob := range activeJobs {
+		jobRef, err := ref.GetReference(r.Scheme, activeJob)
+		if err != nil {
+			log.Error(err, "无法引用正在进行的作业", "job", jobRef)
+		}
+		cronJob.Status.Active = append(cronJob.Status.Active, *jobRef)
+	}
+
+	log.V(1).
+		Info("job count",
+			"active jobs", len(activeJobs),
+			"successful jobs", len(successfulJobs),
+			"failed jobs", len(failedJobs))
+
+	// 更新cronJob的status状态
+	if err := r.Status().Update(ctx, &cronJob); err != nil {
+		log.Error(err, "无法更新定时任务状态")
+		return ctrl.Result{}, err
+	}
+
+	deleteLimitFunc := func(limit *int32, jobs []*kbatch.Job, state string) {
+		if limit != nil {
+			sort.Slice(jobs, func(i, j int) bool {
+				if jobs[i].Status.StartTime == nil {
+					return jobs[i].Status.StartTime != nil
+				}
+				return jobs[i].Status.StartTime.Before(jobs[j].Status.StartTime)
+			})
+			for i, job := range jobs {
+				if i >= len(failedJobs)-int(*cronJob.Spec.FailedJobsHistoryLimit) {
+					break
+				}
+
+				if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+					log.Error(err, fmt.Sprintf("无法删除%s的旧任务", state), "job", job)
+				} else {
+					log.V(0).Info(fmt.Sprintf("删除%s的旧任务", state), "job", job)
+				}
+			}
+		}
+	}
+
+	// 删除失败的旧任务
+	deleteLimitFunc(cronJob.Spec.FailedJobsHistoryLimit, failedJobs, "失败")
+	// 删除成功的旧任务
+	deleteLimitFunc(cronJob.Spec.SuccessfulJobsHistoryLimit, successfulJobs, "失败")
+
+	if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend == true {
+		log.V(1).Info("定时任务被挂起，跳过执行")
+		return ctrl.Result{}, nil
 	}
 
 	return ctrl.Result{}, nil
