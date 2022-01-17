@@ -65,6 +65,7 @@ type CronJobSpec struct {
 	ConcurrencyPolicy ConcurrencyPolicy `json:"concurrencyPolicy,omitempty"`
 
 	// 此标志告诉控制器暂停后续执行，已执行的不受影响
+	// +optional
 	Suspend *bool `json:"suspend,omitempty"`
 
 	// 指定在执行CronJob时创建的任务。
@@ -75,6 +76,7 @@ type CronJobSpec struct {
 	SuccessfulJobsHistoryLimit *int32 `json:"successfulJobsHistoryLimit,omitempty"`
 
 	// 失败工作数量的历史记录个数
+	// +optional
 	FailedJobsHistoryLimit *int32 `json:"failedJobsHistoryLimit,omitempty"`
 }
 
