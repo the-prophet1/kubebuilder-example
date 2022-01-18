@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"github.com/robfig/cron"
 	kbatch "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -192,6 +193,70 @@ func (r *CronJobReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		return ctrl.Result{}, nil
 	}
 
+	getNextSchedule := func(cronjob *batch.CronJob, now time.Time) (lastMissed time.Time, next time.Time, err error) {
+		sched, err := cron.ParseStandard(cronjob.Spec.Schedule)
+		if err != nil {
+			return time.Time{}, time.Time{},
+				fmt.Errorf("无法解析时间表: %q: %v", cronJob.Spec.Schedule, err)
+		}
+
+		var earliestTime time.Time
+		if cronjob.Status.LastScheduleTime != nil {
+			earliestTime = cronJob.Status.LastScheduleTime.Time
+		} else {
+			earliestTime = cronJob.ObjectMeta.CreationTimestamp.Time
+		}
+
+		if cronjob.Spec.StartingDeadlineSeconds != nil {
+			schedulingDeadline := now.Add(-time.Second * time.Duration(*cronJob.Spec.StartingDeadlineSeconds))
+			if schedulingDeadline.After(earliestTime) {
+				earliestTime = schedulingDeadline
+			}
+
+			if earliestTime.After(now) {
+				return time.Time{}, sched.Next(now), nil
+			}
+
+			starts := 0
+			for t := sched.Next(earliestTime); !t.After(now); t = sched.Next(t) {
+				lastMissed = t
+				starts++
+				if starts > 100 {
+					// 我们无法获得最近的时间，所以只返回一个空切片
+					return time.Time{}, time.Time{}, fmt.Errorf("错过的开始时间太多 (> 100)。 设置或减少 .spec.startingDeadlineSeconds 或检查时钟偏差。")
+				}
+			}
+		}
+		// 返回最后错过的时间，和下一次调度的时间
+		return lastMissed, sched.Next(now), nil
+	}
+
+	// 计算出定时任务下一次执行时间（或是遗漏的执行时间）
+	missedRun, nextRun, err := getNextSchedule(&cronJob, r.Now())
+	if err != nil {
+		log.Error(err, "无法弄清楚 CronJob 时间表")
+		// 在我们得到修复时间表的更新之前，我们并不真正关心重新排队，所以不要返回错误
+		return ctrl.Result{}, nil
+	}
+
+	scheduledResult := ctrl.Result{RequeueAfter: nextRun.Sub(r.Now())} // 保存以便别处复用
+	log = log.WithValues("now", r.Now(), "next run", nextRun)
+
+	if missedRun.IsZero() {
+		log.V(1).Info("没有即将到来的任务，进入睡眠")
+		return scheduledResult, nil
+	}
+
+	// 确保错过的执行没有超过截止时间
+	log = log.WithValues("current run", missedRun)
+	tooLate := false
+	if cronJob.Spec.StartingDeadlineSeconds != nil {
+		tooLate = missedRun.Add(time.Duration(*cronJob.Spec.StartingDeadlineSeconds) * time.Second).Before(r.Now())
+	}
+	if tooLate {
+		log.V(1).Info("missed starting deadline for last run, sleeping till next")
+		return scheduledResult, nil
+	}
 	return ctrl.Result{}, nil
 }
 
