@@ -55,7 +55,8 @@ type CronJobReconciler struct {
 
 var (
 	scheduledTimeAnnotation = "batch.tutorial.kubebuilder.io/scheduled-at"
-	jobOwnerKey             = ""
+	jobOwnerKey             = ".metadata.controller"
+	apiGVStr                = batch.GroupVersion.String()
 )
 
 // +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
@@ -257,10 +258,94 @@ func (r *CronJobReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		log.V(1).Info("missed starting deadline for last run, sleeping till next")
 		return scheduledResult, nil
 	}
-	return ctrl.Result{}, nil
+
+	// 确定要 job 的执行策略 —— 并发策略可能禁止多个job同时运行
+	if cronJob.Spec.ConcurrencyPolicy == batch.ForbidConcurrent && len(activeJobs) > 0 {
+		log.V(1).Info("并发策略禁止并行进行，跳过", "正在执行的个数", len(activeJobs))
+		return scheduledResult, nil
+	}
+
+	// 直接覆盖当前执行的job,则先删除现在运行的job
+	if cronJob.Spec.ConcurrencyPolicy == batch.ReplaceConcurrent {
+		for _, activeJob := range activeJobs {
+			if err := r.Delete(ctx, activeJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
+	// 构建新的job
+	constructJobForCronJob := func(cronJob *batch.CronJob, scheduledTime time.Time) (*kbatch.Job, error) {
+		//job 名称带上执行时间以确保唯一性，避免排定执行时间的 job 创建两次
+		name := fmt.Sprintf("%s-%d", cronJob.Name, scheduledTime.Unix())
+
+		job := &kbatch.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels:      map[string]string{},
+				Annotations: map[string]string{},
+				Name:        name,
+				Namespace:   cronJob.Namespace,
+			},
+			Spec: *cronJob.Spec.JobTemplate.Spec.DeepCopy(),
+		}
+
+		for k, v := range cronJob.Annotations {
+			job.Annotations[k] = v
+		}
+		job.Annotations[scheduledTimeAnnotation] = scheduledTime.Format(time.RFC3339)
+		for k, v := range cronJob.Spec.JobTemplate.Labels {
+			job.Labels[k] = v
+		}
+
+		if err := ctrl.SetControllerReference(cronJob, job, r.Scheme); err != nil {
+			return nil, err
+		}
+		return job, nil
+	}
+
+	job, err := constructJobForCronJob(&cronJob, missedRun)
+	if err != nil {
+		log.Error(err, "无法从模板构建job”")
+		// job 的 spec 没有变更，无需重新排队
+		return scheduledResult, nil
+	}
+
+	// ...在集群中创建 job
+	if err := r.Create(ctx, job); err != nil {
+		log.Error(err, "不允许构建job", "job", job)
+		return ctrl.Result{}, err
+	}
+
+	log.V(1).Info("为 CronJob 运行创建job", "job", job)
+
+	// 当有 job 进入运行状态后，重新排队，同时更新状态
+	return scheduledResult, nil
 }
 
 func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// 此处不是测试，我们需要创建一个真实的时钟
+	if r.Clock == nil {
+		r.Clock = realClock{}
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &kbatch.Job{}, jobOwnerKey, func(rawObj runtime.Object) []string {
+		//获取 job 对象，提取 owner...
+		job := rawObj.(*kbatch.Job)
+		// 返回job 对应的控制器
+		owner := metav1.GetControllerOf(job)
+		if owner == nil {
+			return nil
+		}
+		// ...确保 owner 是个 CronJob...
+		if owner.APIVersion != apiGVStr || owner.Kind != "CronJob" {
+			return nil
+		}
+
+		// ...是 CronJob，返回
+		return []string{owner.Name}
+	}); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&batch.CronJob{}).
 		Complete(r)

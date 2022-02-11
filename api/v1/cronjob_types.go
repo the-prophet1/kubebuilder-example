@@ -33,13 +33,13 @@ type ConcurrencyPolicy string
 
 const (
 
-	// AllowConcurrent允许CronJobs并发运行。
+	// AllowConcurrent 允许CronJobs并发运行。
 	AllowConcurrent ConcurrencyPolicy = "Allow"
 
 	// ForbidConcurrent 禁止并发运行，如果上一个尚未完成则跳过下一个运行。
 	ForbidConcurrent ConcurrencyPolicy = "Forbid"
 
-	// ReplaceConcurrent取消当前正在运行的作业，并用一个新的作业替换它。
+	// ReplaceConcurrent 取消当前正在运行的作业，并用一个新的作业替换它。
 	ReplaceConcurrent ConcurrencyPolicy = "Replace"
 )
 
