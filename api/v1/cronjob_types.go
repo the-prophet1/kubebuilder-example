@@ -1,5 +1,5 @@
 /*
-
+Copyright 2022.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -94,7 +94,8 @@ type CronJobStatus struct {
 	LastScheduleTime *metav1.Time `json:"lastScheduleTime"`
 }
 
-// +kubebuilder:object:root=true
+//+kubebuilder:object:root=true
+//+kubebuilder:subresource:status
 
 // CronJob is the Schema for the cronjobs API
 type CronJob struct {
@@ -105,7 +106,7 @@ type CronJob struct {
 	Status CronJobStatus `json:"status,omitempty"`
 }
 
-// +kubebuilder:object:root=true
+//+kubebuilder:object:root=true
 
 // CronJobList contains a list of CronJob
 type CronJobList struct {
