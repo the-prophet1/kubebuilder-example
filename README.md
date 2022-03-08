@@ -1,0 +1,2 @@
+# kubebuilder-example
+基于kubebuilder教程实现的一个operator
